@@ -2,11 +2,15 @@ import streamlit as st
 import pandas as pd
 from langchain_ollama.chat_models import ChatOllama
 from langchain.messages import AIMessage, SystemMessage, HumanMessage
+from langchain.tools import tool
+from langchain.agents import create_agent
 import os
+import re
 import requests
 from pathlib import Path
 from io import StringIO
 import traceback
+from datetime import datetime
 from typing import List, Dict, Any
 
 # Configuration Streamlit
@@ -28,40 +32,91 @@ if "llm_initialized" not in st.session_state:
     st.session_state.llm_initialized = False
 if "llm" not in st.session_state:
     st.session_state.llm = None
+if "action_history" not in st.session_state:
+    st.session_state.action_history = []
 
 # SYSTEM PROMPT Imora
 SYSTEM_PROMPT = """
 # 🧠 IMORA — Agent d'Intelligence Artificielle
 
-Tu es **Imora**, un spécialiste en analyse de données et intelligence artificielle.
+Tu es **Imora**, un agent spécialisé en analyse de données, nettoyage, imputation,
+gestion de snapshots, détection d'anomalies et machine learning.
 
-## 🎯 Compétences
-- Analyse exploratoire de données
-- Détection de valeurs manquantes et anomalies
-- Nettoyage et préparation de données
-- Conseils sur le machine learning
+## ⚠️ Règles strictes
+- Tu dois utiliser exclusivement les outils disponibles.
+- Aucune modification des données sans demande explicite de l'utilisateur.
+- Analyse toujours avant de proposer ou appliquer une transformation.
+- Si l'utilisateur demande une exploration, fournis un diagnostic clair et structuré.
+- Si l'utilisateur demande un nettoyage ou une transformation, crée un snapshot avant,
+utilise l'outil approprié, puis propose une sauvegarde.
 
-## ⚠️ Principe Fondamental
-**Aucune modification sans demande explicite de l'utilisateur.**
+## 🔎 Diagnostic obligatoire
+Réponds systématiquement avec un rapport d'analyse structuré avant toute action.
 
-## 📊 Fonctionnement
-1. Analyse d'abord
-2. Justifie tes recommandations
-3. Propose une action si approprié
-4. Attends la confirmation avant d'agir
+## 📌 Outils disponibles
+- open_df, get_dataset_description, get_file_type, read_non_binary_file, download_from_url
+- normalize_date, normalize_int, normalize_float, replace_specific_value,
+  remove_specific_characters, rename_columns
+- missing_data_diagnostic, detect_missing_values, analyze_numeric_columns,
+  detect_outliers, handle_outliers
+- delete_rows_with_missing_values, impute_missing_values, replace_missing_values,
+  knn_imputation, ml_regression_imputer, ml_classifier_imputer
+- encode_categorical_columns, normalize_categorical_columns
+- create_snapshot, restore_snapshot, list_snapshots, delete_snapshot, save_df
+- linear_regression_model, random_forest_model, gradient_boosting_regressor_model,
+  random_forest_classifier_model, gradient_boosting_classifier_model,
+  kmeans_clustering_model, dbscan_clustering_model
+- get_models_list, make_prediction, save_model, load_model, query_database, search_web
 
-## 🔧 Outils disponibles
-- Analyse de types de colonnes
-- Diagnostic des valeurs manquantes
-- Détection d'outliers
-- Suggestions de nettoyage
-
-Tu es rigoureux, justificatif et prudent. Toujours traçable.
+## 🧠 Style de réponse
+- Utilise un format Markdown clair.
+- Indique toujours les risques et les recommandations.
+- N'agis pas sans confirmation explicite de l'utilisateur.
 """
 
 # Registres globaux pour outils
 models_registry: Dict[str, Any] = {}
 _snapshots: Dict[str, pd.DataFrame] = {}
+
+def risk_type(percent: float) -> str:
+    if percent < 5:
+        return "MCAR probable"
+    if percent < 20:
+        return "MAR probable"
+    if percent < 40:
+        return "MNAR possible"
+    return "Variable à risque"
+
+
+def type_imputation(percent: float) -> str:
+    if percent < 5:
+        return "Imputation simple"
+    if percent < 20:
+        return "Imputation prudente"
+    if percent < 40:
+        return "Analyse approfondie"
+    if percent > 70:
+        return "Suppression quasi systématique"
+    if percent > 40:
+        return "Suppression fréquente"
+    return "Variable à risque, imputation non recommandée"
+
+
+def log_action(action_type: str, description: str, result: str | None = None) -> None:
+    """Enregistre une action ou un événement dans l'historique."""
+    st.session_state.action_history.append({
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "action_type": action_type,
+        "description": description,
+        "result": result,
+    })
+
+
+def extract_snapshot_name(description: str) -> str | None:
+    """Extrait un nom de snapshot depuis une description d'action."""
+    match = re.search(r"Snapshot '([^']+)'", description)
+    return match.group(1) if match else None
+
 
 def get_dataset_description(df: pd.DataFrame) -> str:
     """Fournit une description complète du dataset"""
@@ -658,7 +713,7 @@ def load_model(model_name: str, file_path: str) -> str:
         return f"Erreur load_model: {e}"
 
 def initialize_llm():
-    """Initialise le modèle LLM via le tunnel ngrok"""
+    """Initialise le modèle LLM via le tunnel ngrok et crée l'agent LangChain"""
     if not st.session_state.llm_initialized:
         try:
             model_name = st.session_state.get("selected_model", "qwen3:4b")
@@ -666,6 +721,57 @@ def initialize_llm():
                 model=model_name,
                 base_url=OLLAMA_TUNNEL_URL,
                 temperature=0.7
+            )
+
+            tools_list = [
+                tool(open_df),
+                tool(get_file_type),
+                tool(download_from_url),
+                tool(read_non_binary_file),
+                tool(normalize_date),
+                tool(missing_data_diagnostic),
+                tool(query_database),
+                tool(search_web),
+                tool(delete_rows_with_missing_values),
+                tool(impute_missing_values),
+                tool(replace_missing_values),
+                tool(normalize_float),
+                tool(normalize_int),
+                tool(analyze_numeric_columns),
+                tool(replace_specific_value),
+                tool(remove_specific_characters),
+                tool(rename_columns),
+                tool(knn_imputation),
+                tool(save_df),
+                tool(create_snapshot),
+                tool(restore_snapshot),
+                tool(list_snapshots),
+                tool(delete_snapshot),
+                tool(encode_categorical_columns),
+                tool(normalize_categorical_columns),
+                tool(detect_outliers),
+                tool(handle_outliers),
+                tool(ml_regression_imputer),
+                tool(ml_classifier_imputer),
+                tool(linear_regression_model),
+                tool(random_forest_model),
+                tool(gradient_boosting_regressor_model),
+                tool(random_forest_classifier_model),
+                tool(gradient_boosting_classifier_model),
+                tool(kmeans_clustering_model),
+                tool(dbscan_clustering_model),
+                tool(get_models_list),
+                tool(make_prediction),
+                tool(save_model),
+                tool(load_model),
+                tool(get_dataset_description),
+            ]
+
+            st.session_state.agent = create_agent(
+                model=st.session_state.llm,
+                system_prompt=SystemMessage(content=SYSTEM_PROMPT),
+                tools=tools_list,
+                debug=False,
             )
             st.session_state.llm_initialized = True
             st.session_state.current_model = model_name
@@ -734,13 +840,14 @@ def ask_imora_agent(question: str, df: pd.DataFrame = None) -> tuple[str, dict]:
             if df.shape[1] > 10:
                 context += f"... (+{df.shape[1] - 10} autres)"
         
-        # Appeler le LLM
+        # Appeler l'agent LangChain
         messages = [
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=context)
         ]
-        
-        response = st.session_state.llm.invoke(messages)
+        inputs = {"messages": messages}
+        result = st.session_state.agent.invoke(inputs)
+        response = result["messages"][-1].content
         elapsed_time = time.time() - start_time
         
         # Métadonnées pour la réflexion
@@ -820,6 +927,69 @@ with col2:
     st.metric("Colonnes", summary["shape"][1])
     st.metric("Lignes", summary["shape"][0])
 
+# Section actions rapides
+st.markdown("---")
+st.subheader("⚡ Actions rapides")
+quick_col1, quick_col2, quick_col3 = st.columns(3)
+
+with quick_col1:
+    if st.button("🔍 Diagnostic dataset", key="quick_diag"):
+        with st.spinner("Analyse en cours..."):
+            desc = get_dataset_description(st.session_state.dataset)
+            st.markdown(desc)
+            log_action("diagnostic", "Diagnostic dataset exécuté", "Description générée")
+
+with quick_col2:
+    if st.button("❌ Valeurs manquantes", key="quick_missing"):
+        with st.spinner("Détection..."):
+            missing = detect_missing_values(st.session_state.dataset)
+            st.markdown(missing)
+            log_action("missing_values", "Détection des valeurs manquantes exécutée", missing)
+
+with quick_col3:
+    if st.button("📈 Détecter outliers", key="quick_outliers"):
+        with st.spinner("Analyse outliers..."):
+            outliers = detect_outliers_simple(st.session_state.dataset)
+            st.markdown(outliers)
+            log_action("outliers", "Détection d'outliers exécutée", outliers)
+
+snapshot_name = st.text_input("Nom snapshot rapide", value="snapshot_1", key="quick_snapshot_name")
+restore_snapshot_choice = st.selectbox("Restaurer snapshot", list_snapshots() or ["Aucun"], key="quick_restore_choice")
+create_snapshot_col, restore_snapshot_col = st.columns(2)
+with create_snapshot_col:
+    if st.button("💾 Créer un snapshot", key="quick_create_snapshot"):
+        if snapshot_name:
+            result = create_snapshot(snapshot_name)
+            st.success(result)
+            log_action("create_snapshot", f"Snapshot '{snapshot_name}' créé", result)
+        else:
+            st.warning("Veuillez entrer un nom de snapshot.")
+with restore_snapshot_col:
+    if st.button("♻️ Restaurer le snapshot", key="quick_restore_snapshot"):
+        if restore_snapshot_choice and restore_snapshot_choice != "Aucun":
+            result = restore_snapshot(restore_snapshot_choice)
+            st.success(result)
+            log_action("restore_snapshot", f"Snapshot '{restore_snapshot_choice}' restauré", result)
+            st.experimental_rerun()
+        else:
+            st.warning("Aucun snapshot disponible à restaurer.")
+
+# Section snapshots dédiés
+st.markdown("---")
+st.subheader("🗄️ Snapshots")
+current_snapshots = list_snapshots()
+if current_snapshots:
+    for snap_name in current_snapshots:
+        snap_col1, snap_col2 = st.columns([4, 1])
+        snap_col1.write(f"- **{snap_name}**")
+        if snap_col2.button(f"♻️ Restaurer", key=f"restore_snap_{snap_name}"):
+            result = restore_snapshot(snap_name)
+            st.success(result)
+            log_action("restore_snapshot", f"Snapshot '{snap_name}' restauré via panneau Snapshot", result)
+            st.experimental_rerun()
+else:
+    st.info("Aucun snapshot créé pour le moment.")
+
 # Section diagnostics rapides
 st.markdown("---")
 col_diag1, col_diag2 = st.columns(2)
@@ -882,6 +1052,30 @@ for idx, (role, text) in enumerate(st.session_state.chat_history):
                 
                 st.markdown(reflection_html, unsafe_allow_html=True)
 
+st.markdown("---")
+st.subheader("🕘 Historique des actions")
+
+if st.button("Effacer l'historique", key="clear_action_history"):
+    st.session_state.action_history.clear()
+    st.success("Historique effacé")
+    st.experimental_rerun()
+
+if len(st.session_state.action_history) == 0:
+    st.info("Aucune action rapide ou chat enregistré pour le moment.")
+else:
+    for idx, entry in enumerate(reversed(st.session_state.action_history[-20:])):
+        with st.expander(f"{entry['timestamp']} — {entry['action_type']}" ):
+            st.write(entry['description'])
+            if entry['result']:
+                st.markdown(f"**Résultat :**\n{entry['result']}")
+            snapshot_name = extract_snapshot_name(entry['description'])
+            if snapshot_name:
+                if st.button("🔁 Restaurer ce snapshot", key=f"restore_hist_{idx}_{snapshot_name}"):
+                    result = restore_snapshot(snapshot_name)
+                    st.success(result)
+                    log_action("restore_snapshot", f"Snapshot '{snapshot_name}' restauré depuis l'historique", result)
+                    st.experimental_rerun()
+
 # Input pour poser une question
 col_q1, col_q2 = st.columns([5, 1])
 with col_q1:
@@ -891,10 +1085,12 @@ with col_q2:
 
 if send_button and question:
     st.session_state.chat_history.append(("user", question))
+    log_action("chat", f"Question envoyée à Imora", question)
     
     with st.spinner("Imora pense..."):
         response, metadata = ask_imora_agent(question, st.session_state.dataset)
     
     st.session_state.chat_history.append(("agent", response))
     st.session_state.chat_metadata.append(metadata)
+    log_action("chat_response", "Réponse Imora reçue", response)
     st.rerun()
